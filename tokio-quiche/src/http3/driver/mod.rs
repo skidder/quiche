@@ -629,35 +629,31 @@ impl<H: DriverHooks> H3Driver<H> {
             h3::Event::Finished => self.process_h3_fin(qconn, stream_id),
 
             h3::Event::Reset(code) => {
-                if let Some(ctx) = self.stream_map.get_mut(&stream_id) {
+                let both_done = if let Some(ctx) = self.stream_map.get_mut(&stream_id) {
                     ctx.handle_recvd_reset(code);
-                    // See if we are waiting on this stream and close the channel
-                    // if we are. If we are not waiting, `handle_recvd_reset()`
-                    // will have taken care of closing.
-                    for pending in self.waiting_streams.iter_mut() {
-                        match pending {
-                            WaitForStream::Upstream(
-                                WaitForUpstreamCapacity {
-                                    stream_id: id,
-                                    chan: Some(chan),
-                                },
-                            ) if stream_id == *id => {
-                                chan.close();
-                            },
-                            _ => {},
-                        }
-                    }
+                    ctx.both_directions_done()
+                } else {
+                    // TODO: if we don't have the stream in our map: should we
+                    // send the H3Event::ResetStream?
+                    return Ok(());
+                };
 
-                    self.h3_event_sender
-                        .send(H3Event::ResetStream { stream_id }.into())
-                        .map_err(|_| H3ConnectionError::ControllerWentAway)?;
-                    if ctx.both_directions_done() {
-                        return self.finish_stream(qconn, stream_id, None, None);
-                    }
+                // Close any pending futures in waiting_streams for this
+                // stream. This ensures wait_for_data doesn't hang waiting
+                // for futures that will never complete.
+                // RST_STREAM closes the peer's write direction (our read direction),
+                // so we only close the Upstream channel (to application).
+                // The Downstream channel remains open so we can still send data.
+                self.close_waiting_stream_channels(stream_id, true, false);
+
+                self.h3_event_sender
+                    .send(H3Event::ResetStream { stream_id }.into())
+                    .map_err(|_| H3ConnectionError::ControllerWentAway)?;
+
+                if both_done {
+                    return self.finish_stream(qconn, stream_id, None, None);
                 }
 
-                // TODO: if we don't have the stream in our map: should we
-                // send the H3Event::ResetStream?
                 Ok(())
             },
 
@@ -924,6 +920,41 @@ impl<H: DriverHooks> H3Driver<H> {
         H3ConnectionError::H3(h3::Error::TransportError(quiche::Error::TlsFail))
     }
 
+    /// Closes any pending futures in `waiting_streams` associated with the
+    /// given `stream_id`.
+    ///
+    /// When a stream is cancelled or reset, any futures waiting on that stream's
+    /// channels must be woken up and closed. Otherwise, `wait_for_data` will
+    /// hang indefinitely waiting for futures that will never complete.
+    ///
+    /// - `close_upstream`: Close the `Upstream` channel (InboundFrameSender).
+    ///   Set to true when the peer resets (RST_STREAM), as we won't receive
+    ///   any more data from them to forward to the application.
+    /// - `close_downstream`: Close the `Downstream` channel (OutboundFrameStream).
+    ///   Set to true when the peer sends STOP_SENDING or when the stream is
+    ///   fully finished, as we shouldn't/can't send any more data to the peer.
+    fn close_waiting_stream_channels(
+        &mut self, stream_id: u64, close_upstream: bool, close_downstream: bool,
+    ) {
+        for pending in self.waiting_streams.iter_mut() {
+            match pending {
+                WaitForStream::Downstream(WaitForDownstreamData {
+                    stream_id: id,
+                    chan: Some(chan),
+                }) if stream_id == *id && close_downstream => {
+                    chan.close();
+                },
+                WaitForStream::Upstream(WaitForUpstreamCapacity {
+                    stream_id: id,
+                    chan: Some(chan),
+                }) if stream_id == *id && close_upstream => {
+                    chan.close();
+                },
+                _ => {},
+            }
+        }
+    }
+
     /// Removes a stream from the stream map if it exists. Also optionally sends
     /// `RESET` or `STOP_SENDING` frames if `write` or `read` is set to an
     /// error code, respectively.
@@ -948,24 +979,9 @@ impl<H: DriverHooks> H3Driver<H> {
                 qconn.stream_shutdown(stream_id, quiche::Shutdown::Write, err);
         }
 
-        // Find if the stream also has any pending futures associated with it
-        for pending in self.waiting_streams.iter_mut() {
-            match pending {
-                WaitForStream::Downstream(WaitForDownstreamData {
-                    stream_id: id,
-                    chan: Some(chan),
-                }) if stream_id == *id => {
-                    chan.close();
-                },
-                WaitForStream::Upstream(WaitForUpstreamCapacity {
-                    stream_id: id,
-                    chan: Some(chan),
-                }) if stream_id == *id => {
-                    chan.close();
-                },
-                _ => {},
-            }
-        }
+        // Close any pending futures waiting on this stream's channels
+        // Since the stream is finished, close both directions.
+        self.close_waiting_stream_channels(stream_id, true, true);
 
         // Close any DATAGRAM-proxying channels when we close the stream, if they
         // exist
@@ -1050,6 +1066,14 @@ impl<H: DriverHooks> H3Driver<H> {
                     if ctx.both_directions_done() {
                         return self.finish_stream(qconn, stream_id, None, None);
                     } else {
+                        // Even if both directions aren't done, we need to close
+                        // any pending futures in waiting_streams for this stream.
+                        // Otherwise wait_for_data will hang forever waiting for
+                        // futures that will never complete.
+                        // STOP_SENDING means we shouldn't send more data, so close
+                        // the Downstream channel (from application). Upstream may
+                        // still be receiving data from peer.
+                        self.close_waiting_stream_channels(stream_id, false, true);
                         return Ok(());
                     }
                 },

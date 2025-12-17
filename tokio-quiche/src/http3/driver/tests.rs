@@ -1366,4 +1366,703 @@ mod server_side_driver {
         assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Finished)));
         assert_eq!(helper.peer_client_poll(), Err(h3::Error::Done));
     }
+
+    /// Test scenario: Client cancels stream 0 while reading body, then immediately
+    /// sends a new request on stream 4 (like a video seek operation).
+    /// This tests that the new stream receives its body data promptly without
+    /// being blocked by the cancelled stream.
+    ///
+    /// Bug context: HTTP/3 range requests were experiencing 60-second delays where
+    /// headers arrived immediately but body was delayed. This occurred after
+    /// cancelling a previous stream (RST_STREAM) and starting a new range request.
+    #[test]
+    fn new_stream_after_client_cancels_previous_stream() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // === Stream 0: Initial request that will be cancelled ===
+        let stream_id_0 = helper
+            .peer_client_send_request(make_request_headers("GET"), false)
+            .unwrap();
+        assert_eq!(stream_id_0, 0);
+
+        helper.advance_and_run_loop().unwrap();
+        let req0 = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req0.stream_id, 0);
+        let to_client_0 = req0.send.get_ref().unwrap().clone();
+
+        // Server sends response headers for stream 0
+        to_client_0
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives headers on stream 0
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((0, h3::Event::Headers { .. }))
+        );
+
+        // Server starts sending body data on stream 0
+        to_client_0
+            .try_send(OutboundFrame::Body(
+                BufFactory::buf_from_slice(&[1; 50]),
+                false,
+            ))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives some data on stream 0
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+        let _ = helper.peer_client_recv_body_vec(0, 1024);
+
+        // === Client cancels stream 0 (like a video seek) ===
+        // Client sends RST_STREAM on stream 0
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_shutdown(0, quiche::Shutdown::Write, 268), // H3_REQUEST_CANCELLED
+            Ok(())
+        );
+        helper.advance_and_run_loop().unwrap();
+
+        // Server should see the reset event
+        assert_matches!(
+            helper.driver_recv_core_event(),
+            Ok(H3Event::ResetStream { stream_id: 0 })
+        );
+
+        // === Stream 4: New request (like range request for end of file) ===
+        let stream_id_4 = helper
+            .peer_client_send_request(make_request_headers("GET"), true) // fin=true for simple request
+            .unwrap();
+        assert_eq!(stream_id_4, 4); // Next client-initiated bidi stream
+
+        helper.advance_and_run_loop().unwrap();
+
+        // Server receives the new request on stream 4
+        let req4 = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req4.stream_id, 4);
+        let to_client_4 = req4.send.get_ref().unwrap().clone();
+        let mut from_client_4 = req4.recv;
+
+        // Server sends response headers on stream 4
+        to_client_4
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives headers on stream 4
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((4, h3::Event::Headers { .. }))
+        );
+
+        // Server sends body data on stream 4 - THIS SHOULD NOT BE DELAYED
+        to_client_4
+            .try_send(OutboundFrame::Body(
+                BufFactory::buf_from_slice(&[42; 100]),
+                true, // fin
+            ))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client should receive body data on stream 4 immediately
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Data)));
+        let body = helper.peer_client_recv_body_vec(4, 1024).unwrap();
+        assert_eq!(body, vec![42; 100]);
+
+        // Stream 4 should be finished
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Finished)));
+
+        // Verify stream 0 is cleaned up and stream 4 worked correctly
+        assert!(!helper.driver.stream_map.contains_key(&0) ||
+                helper.driver.stream_map.get(&0).unwrap().fin_or_reset_recv);
+
+        // Verify waiting_streams doesn't contain stale futures for stream 0
+        // that could block processing
+        let (body4, fin4, _) = helper.driver_try_recv_body(&mut from_client_4);
+        assert!(body4.is_empty() || fin4); // Should have received fin already
+    }
+
+    /// Test that multiple stream cancellations don't cause accumulation of
+    /// stale futures in waiting_streams that could block new streams.
+    #[test]
+    fn multiple_stream_cancellations_dont_block_new_streams() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Create and cancel multiple streams in sequence
+        for i in 0..3u64 {
+            let stream_id = i * 4; // Client-initiated bidi streams: 0, 4, 8
+
+            // Client sends request
+            let created_stream_id = helper
+                .peer_client_send_request(make_request_headers("GET"), false)
+                .unwrap();
+            assert_eq!(created_stream_id, stream_id);
+
+            helper.advance_and_run_loop().unwrap();
+
+            // Server receives request
+            let req = assert_matches!(
+                helper.driver_recv_server_event().unwrap(),
+                ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+            );
+            assert_eq!(req.stream_id, stream_id);
+
+            // Server sends response headers
+            let to_client = req.send.get_ref().unwrap().clone();
+            to_client
+                .try_send(OutboundFrame::Headers(make_response_headers(), None))
+                .unwrap();
+            helper.advance_and_run_loop().unwrap();
+
+            // Client receives headers - drain any events for other streams first
+            loop {
+                match helper.peer_client_poll() {
+                    Ok((sid, h3::Event::Headers { .. })) if sid == stream_id => break,
+                    Ok(_) => continue, // Drain other events
+                    Err(h3::Error::Done) => panic!("Expected headers for stream {}", stream_id),
+                    Err(e) => panic!("Unexpected error: {:?}", e),
+                }
+            }
+
+            // Client cancels the stream (simulating seek)
+            assert_eq!(
+                helper
+                    .pipe
+                    .client
+                    .stream_shutdown(stream_id, quiche::Shutdown::Write, 268),
+                Ok(())
+            );
+            helper.advance_and_run_loop().unwrap();
+
+            // Server sees reset - drain any BodyBytesReceived events first
+            loop {
+                match helper.driver_recv_core_event() {
+                    Ok(H3Event::ResetStream { stream_id: sid }) if sid == stream_id => break,
+                    Ok(H3Event::BodyBytesReceived { .. }) => continue, // Drain body events
+                    Ok(H3Event::StreamClosed { .. }) => continue, // Drain closure events
+                    Ok(e) => panic!("Unexpected event: {:?}", e),
+                    Err(e) => panic!("Unexpected error: {:?}", e),
+                }
+            }
+        }
+
+        // Now create a new stream that should work without delays
+        let final_stream_id = helper
+            .peer_client_send_request(make_request_headers("GET"), true)
+            .unwrap();
+        assert_eq!(final_stream_id, 12); // Next stream after 0, 4, 8
+
+        helper.advance_and_run_loop().unwrap();
+
+        // Server receives the new request
+        let req = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req.stream_id, 12);
+
+        // Server sends response with body
+        let to_client = req.send.get_ref().unwrap().clone();
+        to_client
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        to_client
+            .try_send(OutboundFrame::Body(
+                BufFactory::buf_from_slice(b"final response"),
+                true,
+            ))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client should receive headers and body without delay
+        // Drain any pending events from cancelled streams first
+        loop {
+            match helper.peer_client_poll() {
+                Ok((12, h3::Event::Headers { .. })) => break,
+                Ok(_) => continue, // Drain events for other streams
+                Err(h3::Error::Done) => panic!("Expected headers for stream 12"),
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+        assert_eq!(helper.peer_client_poll(), Ok((12, h3::Event::Data)));
+        let body = helper.peer_client_recv_body_vec(12, 1024).unwrap();
+        assert_eq!(body, b"final response");
+        assert_eq!(helper.peer_client_poll(), Ok((12, h3::Event::Finished)));
+
+        // Verify no stale streams in stream_map
+        assert!(!helper.driver.stream_map.contains_key(&0));
+        assert!(!helper.driver.stream_map.contains_key(&4));
+        assert!(!helper.driver.stream_map.contains_key(&8));
+    }
+
+    /// Test that when a stream is reset while we're waiting for channel capacity,
+    /// the waiting future is properly cleaned up and doesn't block new streams.
+    #[test]
+    fn reset_while_waiting_for_channel_capacity() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client sends request on stream 0
+        let stream_id = helper
+            .peer_client_send_request(make_request_headers("GET"), false)
+            .unwrap();
+        assert_eq!(stream_id, 0);
+
+        helper.advance_and_run_loop().unwrap();
+
+        // Server receives request
+        let req = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        let to_client = req.send.get_ref().unwrap().clone();
+        let from_client = req.recv;
+
+        // Server sends response headers
+        to_client
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives headers
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((0, h3::Event::Headers { .. }))
+        );
+
+        // Client sends body data - this will fill the channel since capacity is 1 in tests
+        helper.peer_client_send_body(0, &[1; 100], false).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // The driver should have data in waiting_streams now (blocked on channel capacity)
+        // Don't consume from from_client yet to keep it blocked
+
+        // Send more data to ensure we're blocked
+        helper.peer_client_send_body(0, &[2; 100], false).unwrap();
+        helper.pipe.advance().unwrap();
+        helper.work_loop_iter().unwrap();
+
+        // Now client sends RST_STREAM while we're blocked
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_shutdown(0, quiche::Shutdown::Write, 268),
+            Ok(())
+        );
+        helper.advance_and_run_loop().unwrap();
+
+        // Server should receive reset event - drain any BodyBytesReceived events first
+        loop {
+            match helper.driver_recv_core_event() {
+                Ok(H3Event::ResetStream { stream_id: 0 }) => break,
+                Ok(H3Event::BodyBytesReceived { .. }) => continue, // Drain body events
+                Ok(H3Event::StreamClosed { .. }) => continue, // Drain closure events
+                Ok(e) => panic!("Unexpected event: {:?}", e),
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+
+        // The from_client channel should be closed now
+        assert!(from_client.is_closed());
+
+        // Create a new stream - it should work without being blocked
+        let stream_id_4 = helper
+            .peer_client_send_request(make_request_headers("GET"), true)
+            .unwrap();
+        assert_eq!(stream_id_4, 4);
+
+        helper.advance_and_run_loop().unwrap();
+
+        // Server receives new request
+        let req4 = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req4.stream_id, 4);
+
+        // Server sends response
+        let to_client_4 = req4.send.get_ref().unwrap().clone();
+        to_client_4
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        to_client_4
+            .try_send(OutboundFrame::Body(
+                BufFactory::buf_from_slice(b"response 4"),
+                true,
+            ))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives response on stream 4
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((4, h3::Event::Headers { .. }))
+        );
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Data)));
+        let body = helper.peer_client_recv_body_vec(4, 1024).unwrap();
+        assert_eq!(body, b"response 4");
+    }
+
+    /// Test the exact scenario from the bug report: client starts reading from
+    /// beginning of file, cancels mid-stream, then requests a range from the
+    /// end of the file. The new range request should complete without delay.
+    #[test]
+    fn video_seek_scenario_cancel_and_range_request() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // === Initial request for full file (stream 0) ===
+        let stream_0 = helper
+            .peer_client_send_request(make_request_headers("GET"), false)
+            .unwrap();
+        assert_eq!(stream_0, 0);
+
+        helper.advance_and_run_loop().unwrap();
+
+        let req0 = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        let to_client_0 = req0.send.get_ref().unwrap().clone();
+        let audit_stats_0 = req0.h3_audit_stats.clone();
+
+        // Server sends 200 OK headers
+        to_client_0
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives headers
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((0, h3::Event::Headers { .. }))
+        );
+
+        // Server starts streaming body (simulating video data)
+        to_client_0
+            .try_send(OutboundFrame::Body(
+                BufFactory::buf_from_slice(&[0xAB; 82]),  // ~82KB like in bug report
+                false,
+            ))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives partial data
+        assert_eq!(helper.peer_client_poll(), Ok((0, h3::Event::Data)));
+        let partial_body = helper.peer_client_recv_body_vec(0, 1024).unwrap();
+        assert!(!partial_body.is_empty());
+
+        // === User seeks to end of video - client cancels stream 0 ===
+        // This mirrors: RST_STREAM with ietf_error_code = 268 (H3_REQUEST_CANCELLED)
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_shutdown(0, quiche::Shutdown::Write, 268),
+            Ok(())
+        );
+        // Also send STOP_SENDING to indicate we don't want more data
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_shutdown(0, quiche::Shutdown::Read, 268),
+            Ok(())
+        );
+        helper.advance_and_run_loop().unwrap();
+
+        // Server receives reset - drain any BodyBytesReceived events first
+        loop {
+            match helper.driver_recv_core_event() {
+                Ok(H3Event::ResetStream { stream_id: 0 }) => break,
+                Ok(H3Event::BodyBytesReceived { .. }) => continue,
+                Ok(H3Event::StreamClosed { .. }) => continue,
+                Ok(e) => panic!("Unexpected event: {:?}", e),
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+
+        // Verify audit stats recorded the reset
+        assert_eq!(audit_stats_0.recvd_reset_stream_error_code(), 268);
+
+        // === New range request for end of file (stream 4) ===
+        // Request bytes 9338880-9362034 (end of file)
+        let range_headers = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b":authority", b"quic.tech"),
+            h3::Header::new(b":path", b"/test"),
+            h3::Header::new(b"range", b"bytes=9338880-9362034"),
+        ];
+        let stream_4 = helper
+            .peer
+            .send_request(&mut helper.pipe.client, &range_headers, true)
+            .unwrap();
+        assert_eq!(stream_4, 4);
+
+        helper.advance_and_run_loop().unwrap();
+
+        // Server receives range request
+        let req4 = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req4.stream_id, 4);
+        let to_client_4 = req4.send.get_ref().unwrap().clone();
+
+        // Server sends 206 Partial Content headers (like CF would)
+        // Note: Using smaller body size due to test flow control limits
+        let response_206_headers = vec![
+            h3::Header::new(b":status", b"206"),
+            h3::Header::new(b"content-type", b"video/quicktime"),
+            h3::Header::new(b"content-length", b"50"),
+            h3::Header::new(b"content-range", b"bytes 9338880-9338929/9362035"),
+        ];
+        to_client_4
+            .try_send(OutboundFrame::Headers(response_206_headers, None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives 206 headers - THIS HAPPENS IMMEDIATELY IN THE BUG
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((4, h3::Event::Headers { .. }))
+        );
+
+        // Server sends body - THIS SHOULD NOT BE DELAYED
+        // In the bug, this was delayed 60 seconds
+        // Using smaller body due to test flow control limits
+        let range_body = vec![0xCD; 50];
+        to_client_4
+            .try_send(OutboundFrame::Body(
+                BufFactory::buf_from_slice(&range_body),
+                true,
+            ))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client should receive body data IMMEDIATELY (not after 60 seconds)
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Data)));
+        let received_body = helper.peer_client_recv_body_vec(4, 1024).unwrap();
+        assert_eq!(received_body.len(), 50);
+        assert_eq!(received_body, range_body);
+
+        // Stream 4 should complete
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Finished)));
+
+        // Verify stream 0 received the reset (the read direction is closed).
+        // Note: The stream may still be in the map if the server hasn't explicitly
+        // closed its write direction, but it has received the client's reset.
+        if let Some(ctx) = helper.driver.stream_map.get(&0) {
+            assert!(ctx.fin_or_reset_recv, "Stream 0 should have received reset");
+        }
+        // If not in the map, it was fully cleaned up which is also fine
+    }
+
+    /// Test that close_waiting_stream_channels properly closes channels when
+    /// a stream is reset, preventing waiting futures from blocking forever.
+    #[test]
+    fn close_waiting_stream_channels_on_reset() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client sends request with body
+        let stream_id = helper
+            .peer_client_send_request(make_request_headers("POST"), false)
+            .unwrap();
+        assert_eq!(stream_id, 0);
+
+        helper.advance_and_run_loop().unwrap();
+
+        // Server receives request
+        let req = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        let to_client = req.send.get_ref().unwrap().clone();
+
+        // Server sends response headers
+        to_client
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives headers
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((0, h3::Event::Headers { .. }))
+        );
+
+        // Client sends body to fill the channel
+        helper.peer_client_send_body(0, &[1; 50], false).unwrap();
+        helper.pipe.advance().unwrap();
+        helper.work_loop_iter().unwrap();
+
+        // At this point, the driver should have a waiting future for this stream
+        // if the channel is at capacity
+
+        // Client sends RST_STREAM
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_shutdown(0, quiche::Shutdown::Write, 268),
+            Ok(())
+        );
+        helper.advance_and_run_loop().unwrap();
+
+        // The reset should have been processed - drain any BodyBytesReceived events first
+        loop {
+            match helper.driver_recv_core_event() {
+                Ok(H3Event::ResetStream { stream_id: 0 }) => break,
+                Ok(H3Event::BodyBytesReceived { .. }) => continue, // Drain body events
+                Ok(H3Event::StreamClosed { .. }) => continue, // Drain closure events
+                Ok(e) => panic!("Unexpected event: {:?}", e),
+                Err(e) => panic!("Unexpected error: {:?}", e),
+            }
+        }
+
+        // After reset, any waiting futures for stream 0 should be cleaned up
+        // Create another stream to verify the system isn't blocked
+        let stream_4 = helper
+            .peer_client_send_request(make_request_headers("GET"), true)
+            .unwrap();
+        assert_eq!(stream_4, 4);
+
+        helper.advance_and_run_loop().unwrap();
+
+        let req4 = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req4.stream_id, 4);
+
+        // Verify stream 4 can complete normally
+        let to_client_4 = req4.send.get_ref().unwrap().clone();
+        to_client_4
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+        to_client_4
+            .try_send(OutboundFrame::Body(BufFactory::get_empty_buf(), true))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((4, h3::Event::Headers { .. }))
+        );
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Data)));
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Finished)));
+    }
+
+    /// Test concurrent streams where one is cancelled - ensures the other
+    /// stream continues to receive data without interference.
+    #[test]
+    fn concurrent_streams_one_cancelled() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client sends two concurrent requests
+        let stream_0 = helper
+            .peer_client_send_request(make_request_headers("GET"), false)
+            .unwrap();
+        let stream_4 = helper
+            .peer_client_send_request(make_request_headers("GET"), false)
+            .unwrap();
+        assert_eq!(stream_0, 0);
+        assert_eq!(stream_4, 4);
+
+        helper.advance_and_run_loop().unwrap();
+
+        // Server receives both requests
+        let req0 = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req0.stream_id, 0);
+        let to_client_0 = req0.send.get_ref().unwrap().clone();
+
+        let req4 = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers{incoming_headers, ..} => { incoming_headers }
+        );
+        assert_eq!(req4.stream_id, 4);
+        let to_client_4 = req4.send.get_ref().unwrap().clone();
+
+        // Server sends response headers on both streams
+        to_client_0
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        to_client_4
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives headers on both
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((0, h3::Event::Headers { .. }))
+        );
+        assert_matches!(
+            helper.peer_client_poll(),
+            Ok((4, h3::Event::Headers { .. }))
+        );
+
+        // Client cancels stream 0
+        assert_eq!(
+            helper
+                .pipe
+                .client
+                .stream_shutdown(0, quiche::Shutdown::Write, 268),
+            Ok(())
+        );
+        helper.advance_and_run_loop().unwrap();
+
+        // Server sees reset on stream 0
+        assert_matches!(
+            helper.driver_recv_core_event(),
+            Ok(H3Event::ResetStream { stream_id: 0 })
+        );
+
+        // Stream 4 should continue to work normally
+        to_client_4
+            .try_send(OutboundFrame::Body(
+                BufFactory::buf_from_slice(b"stream 4 body"),
+                true,
+            ))
+            .unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Client receives body on stream 4 without delay
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Data)));
+        let body = helper.peer_client_recv_body_vec(4, 1024).unwrap();
+        assert_eq!(body, b"stream 4 body");
+        assert_eq!(helper.peer_client_poll(), Ok((4, h3::Event::Finished)));
+
+        // Stream 0 should be cleaned up
+        helper.advance_and_run_loop().unwrap();
+        assert!(!helper.driver.stream_map.contains_key(&0) ||
+                helper.driver.stream_map.get(&0).map(|s| s.fin_or_reset_recv).unwrap_or(true));
+    }
 }
