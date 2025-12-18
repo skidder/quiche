@@ -7851,13 +7851,30 @@ impl<F: BufFactory> Connection<F> {
 
                 // Try stopping the stream.
                 if let Ok((final_size, unsent)) = stream.send.stop(error_code) {
-                    // Claw back some flow control allowance from data that was
-                    // buffered but not actually sent before the stream was
-                    // reset.
+                    // Claw back flow control allowance from data that was
+                    // buffered but not sent, AND from data that was sent.
+                    //
+                    // When the peer sends STOP_SENDING, they are cancelling the stream.
+                    // Since tx_data is never decreased when data is ACKed (it's cumulative),
+                    // we need to subtract ALL the stream's data from tx_data when cancelled.
+                    // This includes:
+                    // - unsent: buffered but not transmitted
+                    // - final_size: transmitted (both ACKed and unacked)
                     //
                     // Note that `tx_cap` will be updated later on, so no need
                     // to touch it here.
-                    self.tx_data = self.tx_data.saturating_sub(unsent);
+                    let total_to_free = unsent.saturating_add(final_size);
+
+                    trace!(
+                        "{} STOP_SENDING on stream {}: final_size={} unsent={} total_to_free={}",
+                        self.trace_id,
+                        stream_id,
+                        final_size,
+                        unsent,
+                        total_to_free
+                    );
+
+                    self.tx_data = self.tx_data.saturating_sub(total_to_free);
 
                     self.tx_buffered =
                         self.tx_buffered.saturating_sub(unsent as usize);
