@@ -758,6 +758,134 @@ mod server_side_driver {
         assert_eq!(audit_stats.downstream_bytes_sent(), 0);
     }
 
+    /// Regression test for Bug 1 (normal path): STOP_SENDING after server queues a body.
+    ///
+    /// This test verifies the NORMAL path works: server sends response headers, then
+    /// queues a body frame. Client sends STOP_SENDING before the body is delivered.
+    /// The body frame causes StreamStopped, handle_recvd_stop_sending fires, and
+    /// upstream_read_ready restores ctx.recv before the handler runs — so the
+    /// recv = None assignment correctly closes the channel.
+    ///
+    /// This test PASSES on current HEAD (normal path is already correct).
+    /// Use test_stop_sending_deadlock_idle_sender for the actual bug.
+    #[test]
+    fn test_stop_sending_deadlock_waiting_streams() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let stream_id = helper
+            .peer_client_send_request(make_request_headers("GET"), false)
+            .unwrap();
+        assert_eq!(stream_id, 0);
+
+        helper.advance_and_run_loop().unwrap();
+        let req = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers { incoming_headers, .. } => { incoming_headers }
+        );
+        let to_client = req.send.get_ref().unwrap().clone();
+        let audit_stats = req.h3_audit_stats;
+
+        // Send response headers → stream enters quiche writable set
+        to_client
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(helper.peer_client_poll(), Ok((0, h3::Event::Headers { .. })));
+        assert_eq!(helper.peer_client_poll(), Err(h3::Error::Done));
+
+        // Empty channel → wait_for_recv() → WaitForDownstreamData → waiting_streams
+        helper.work_loop_iter().unwrap();
+        assert_eq!(helper.driver.waiting_streams.len(), 1);
+
+        // Client sends STOP_SENDING
+        helper.pipe.client.stream_shutdown(stream_id, quiche::Shutdown::Read, 4242).unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        // Application queues a body frame → StreamStopped → upstream_read_ready restores
+        // ctx.recv before handle_recvd_stop_sending fires → channel closes correctly
+        to_client
+            .try_send(OutboundFrame::Body(Bytes::copy_from_slice(&[42u8; 10]), false))
+            .unwrap();
+        helper.work_loop_iter().unwrap();
+
+        assert_eq!(audit_stats.recvd_stop_sending_error_code(), 4242);
+        assert!(to_client.is_closed(), "to_client must close (normal path via upstream_read_ready)");
+        assert_eq!(helper.driver.waiting_streams.len(), 0);
+    }
+
+    /// Regression test for Bug 1 (ACTUAL BUG): STOP_SENDING with idle OutboundFrameSender.
+    ///
+    /// This is the specific scenario that triggers the deadlock:
+    ///   - Server received request, is doing async work (DB query, upstream API call, etc.)
+    ///   - Application holds OutboundFrameSender but has NOT queued any frames yet
+    ///   - Stream is in waiting_streams via WaitForDownstreamData
+    ///   - Client sends STOP_SENDING (navigated away, timeout, etc.)
+    ///   - handle_recvd_stop_sending sets ctx.recv = None (already None — NO-OP)
+    ///   - WaitForDownstreamData holds channel indefinitely
+    ///   - Application never finds out the client cancelled
+    ///
+    /// This test FAILS on current HEAD. It PASSES after the fix:
+    ///   In process_writable_stream() StreamStopped arm, after handle_recvd_stop_sending(),
+    ///   iterate waiting_streams and call chan.close() on the matching WaitForDownstreamData
+    ///   (mirror the existing Reset handler at mod.rs:656).
+    #[test]
+    fn test_stop_sending_deadlock_idle_sender() {
+        let mut helper = DriverTestHelper::<ServerHooks>::new().unwrap();
+        helper.complete_handshake().unwrap();
+        helper.advance_and_run_loop().unwrap();
+
+        let stream_id = helper
+            .peer_client_send_request(make_request_headers("GET"), false)
+            .unwrap();
+        assert_eq!(stream_id, 0);
+
+        helper.advance_and_run_loop().unwrap();
+        let req = assert_matches!(
+            helper.driver_recv_server_event().unwrap(),
+            ServerH3Event::Headers { incoming_headers, .. } => { incoming_headers }
+        );
+        let to_client = req.send.get_ref().unwrap().clone();
+        let _audit_stats = req.h3_audit_stats;
+
+        // Server sends response headers to establish stream in quiche writable set
+        to_client
+            .try_send(OutboundFrame::Headers(make_response_headers(), None))
+            .unwrap();
+
+        helper.advance_and_run_loop().unwrap();
+        assert_matches!(helper.peer_client_poll(), Ok((0, h3::Event::Headers { .. })));
+        assert_eq!(helper.peer_client_poll(), Err(h3::Error::Done));
+
+        // Empty channel → wait_for_recv() → WaitForDownstreamData → waiting_streams
+        helper.work_loop_iter().unwrap();
+        assert_eq!(helper.driver.waiting_streams.len(), 1, "stream must be in waiting_streams");
+        assert!(!to_client.is_closed(), "to_client must be open");
+
+        // Client sends STOP_SENDING — application is still doing async work, no frames queued
+        helper.pipe.client.stream_shutdown(stream_id, quiche::Shutdown::Read, 4242).unwrap();
+
+        // Deliver STOP_SENDING. Application NEVER queues any frames.
+        // Pre-fix: handle_recvd_stop_sending sets ctx.recv = None (already None — no-op).
+        //   WaitForDownstreamData not closed. to_client stays open. Stream leaks.
+        // Post-fix: waiting_streams iterated, chan.close() called. to_client closes.
+        helper.advance_and_run_loop().unwrap();
+        helper.work_loop_iter().unwrap();
+        helper.work_loop_iter().unwrap();
+
+        assert!(
+            to_client.is_closed(),
+            "BUG: OutboundFrameSender must close after STOP_SENDING even when              the application never queues a response body frame.              Pre-fix: handle_recvd_stop_sending() sets self.recv = None (already None              — no-op). WaitForDownstreamData in waiting_streams is never notified.              The stream leaks until the connection closes.              Fix: in process_writable_stream() StreamStopped arm, iterate              waiting_streams and call chan.close() on the matching WaitForDownstreamData              entry (mirror the existing Reset handler at mod.rs:656)."
+        );
+        assert_eq!(
+            helper.driver.waiting_streams.len(),
+            0,
+            "BUG: waiting_streams must be empty after STOP_SENDING (idle sender case)."
+        );
+    }
+
     /// Test the case where the client sends a RESET_STREAM quiche frame.
     /// The peer sends its reset before we send a fin
     #[test]

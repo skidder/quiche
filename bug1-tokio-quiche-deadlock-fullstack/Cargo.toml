@@ -1,0 +1,18 @@
+[package]
+name = "bug1-stop-sending-deadlock"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "repro"
+path = "src/main.rs"
+
+[dependencies]
+quiche = { path = "../quiche", features = ["boringssl-boring-crate", "internal"] }
+tokio = { version = "1", features = ["full"] }
+tokio-quiche = { path = "../tokio-quiche" }
+futures-util = "0.3"
+http = "1"
+tracing = "0.1"
+
+[workspace]
